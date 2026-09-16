@@ -1,0 +1,119 @@
+# build-twrp-a02.yml
+#
+# Workflow do GitHub Actions para compilar o TWRP do Samsung A02 (a02)
+# a partir de um fork do device tree.
+#
+# COMO USAR
+# 1. Coloque este arquivo em: .github/workflows/build-twrp-a02.yml
+#    dentro do repositório do SEU FORK do device tree
+#    (ex: github.com/SEU_USER/twrp_device_samsung_a02)
+# 2. DEVICE_TREE_URL já está apontando pro fork raphasilv247/twrp_device_samsung_a02.
+#    Se usar outro fork/branch, ajuste as variáveis em "env:" abaixo.
+# 3. Rode manualmente pela aba "Actions" > "Build TWRP - A02" > "Run workflow"
+#
+# AVISO IMPORTANTE SOBRE ESPAÇO EM DISCO
+# Runners gratuitos do GitHub Actions têm ~14GB livres por padrão.
+# Um sync do minimal manifest do TWRP + build geralmente precisa de 40-70GB.
+# Este workflow usa a action "maximize-build-space" para liberar espaço
+# (remove Android SDK pré-instalado, .NET, Haskell, etc. da imagem do runner)
+# e faz o sync com --no-clone-bundle e profundidade rasa para economizar.
+# Mesmo assim, pode não ser suficiente dependendo do manifest — nesse caso
+# a alternativa é rodar isso em um runner self-hosted com mais disco.
+
+name: Build TWRP - A02
+
+on:
+  workflow_dispatch: {}
+
+env:
+  DEVICE_TREE_URL: "https://github.com/raphasilv247/twrp_device_samsung_a02"
+  DEVICE_TREE_BRANCH: "twrp-11"
+  DEVICE_PATH: "device/samsung/a02"
+  MANIFEST_URL: "https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git"
+  MANIFEST_BRANCH: "twrp-11"
+  LUNCH_COMBO: "twrp_a02-eng"
+  BUILD_TARGET: "recoveryimage"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    steps:
+      # IMPORTANTE: apt-get roda ANTES de maximize-build-space.
+      # A action de maximizar realoca quase todo o espaço livre da raiz (/)
+      # para o volume de build em /mnt/twrp, deixando só "root-reserve-mb"
+      # de sobra na raiz — o que NÃO é suficiente pro cache/download do apt.
+      # Instalando as dependências primeiro, o apt roda com o disco original
+      # (bem mais folga), e só depois maximizamos o espaço para o repo sync/build.
+      - name: Instalar dependências de build
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git-core gnupg flex bison build-essential zip curl \
+            zlib1g-dev libc6-dev-i386 x11proto-core-dev libx11-dev \
+            lib32z1-dev libgl1-mesa-dev libxml2-utils xsltproc unzip \
+            fontconfig python3 python-is-python3 openjdk-8-jdk bc \
+            lz4 rsync schedtool
+          sudo apt-get clean
+
+      - name: Instalar repo tool
+        run: |
+          mkdir -p ~/bin
+          curl -o ~/bin/repo https://storage.googleapis.com/git-repo-downloads/repo
+          chmod a+x ~/bin/repo
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Configurar git
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "actions@github.com"
+          git config --global color.ui false
+
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 6144
+          swap-size-mb: 4096
+          remove-dotnet: "true"
+          remove-android: "true"
+          remove-haskell: "true"
+          remove-codeql: "true"
+          build-mount-path: "/mnt/twrp"
+
+      - name: repo init
+        working-directory: /mnt/twrp
+        run: |
+          repo init -u "${{ env.MANIFEST_URL }}" -b "${{ env.MANIFEST_BRANCH }}" --depth=1 --git-lfs
+
+      - name: Clonar device tree (seu fork)
+        working-directory: /mnt/twrp
+        run: |
+          rm -rf "${{ env.DEVICE_PATH }}"
+          git clone --depth=1 -b "${{ env.DEVICE_TREE_BRANCH }}" \
+            "${{ env.DEVICE_TREE_URL }}" "${{ env.DEVICE_PATH }}"
+
+      - name: repo sync
+        working-directory: /mnt/twrp
+        run: |
+          repo sync -c -j$(nproc --all) --no-clone-bundle --no-tags --force-sync
+
+      - name: Build recovery
+        working-directory: /mnt/twrp
+        run: |
+          source build/envsetup.sh
+          lunch "${{ env.LUNCH_COMBO }}"
+          mka "${{ env.BUILD_TARGET }}" -j$(nproc --all)
+
+      - name: Localizar imagem gerada
+        working-directory: /mnt/twrp
+        run: |
+          find out/target/product/a02 -maxdepth 1 -name "*.img" -exec ls -lh {} \;
+
+      - name: Upload do artefato
+        uses: actions/upload-artifact@v4
+        with:
+          name: twrp-a02
+          path: |
+            /mnt/twrp/out/target/product/a02/recovery.img
+            /mnt/twrp/out/target/product/a02/*.zip
+          if-no-files-found: warn
